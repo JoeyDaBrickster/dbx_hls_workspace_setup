@@ -62,6 +62,14 @@ from .reference_ingestion import (
     AVAILABLE_LOADERS
 )
 
+# Gold CMS Tables
+from .gold_cms import (
+    CMSResult,
+    run_cms_builds_in_order,
+    CMS_TABLE_REGISTRY,
+    detect_chronic_conditions
+)
+
 __all__ = [
     # Config
     "PipelineConfig",
@@ -93,4 +101,9 @@ __all__ = [
     "run_reference_ingestion_single",
     "verify_reference_tables",
     "AVAILABLE_LOADERS",
+    # Gold CMS
+    "CMSResult",
+    "run_cms_builds_in_order",
+    "CMS_TABLE_REGISTRY",
+    "detect_chronic_conditions",
 ]

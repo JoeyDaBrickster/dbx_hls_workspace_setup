@@ -2,6 +2,33 @@
 Silver Layer Transformations
 
 Transform Bronze layer data into FHIR R4-compliant resources with enforced schemas.
+
+Lookup Table Enrichments:
+-------------------------
+The following transformations include enrichment from bronze lookup tables:
+
+1. Conditions (transform_condition):
+   - lookup_snomed_icd10cm_map: Maps SNOMED codes to ICD-10-CM diagnosis codes
+   
+2. Procedures (transform_procedure):
+   - lookup_hcpcs_codes: Enriches with HCPCS/CPT procedure details and BETOS codes
+   
+3. Medications (transform_medication):
+   - lookup_rxnorm_concepts: RxNorm preferred names and term types
+   - lookup_rxnorm_ndc_crosswalk: Maps RxNorm codes to NDC codes
+   - lookup_ndc_product: NDC product details (proprietary name, dosage form, manufacturer)
+   
+4. Allergies (transform_allergy):
+   - lookup_rxnorm_concepts: RxNorm drug names for drug allergies
+   
+5. Claims (transform_claim):
+   - lookup_icd10cm_codes: ICD-10-CM diagnosis descriptions for primary/secondary diagnoses
+   
+6. Claim Responses (transform_claimresponse):
+   - lookup_hcpcs_codes: HCPCS procedure code descriptions
+
+Note: All lookups are left joins - records will not be dropped if lookup tables are missing
+or if codes are not found in lookup tables.
 """
 
 from dataclasses import dataclass
@@ -222,11 +249,24 @@ def transform_encounter(spark: SparkSession, config: PipelineConfig) -> DataFram
 
 
 def transform_condition(spark: SparkSession, config: PipelineConfig) -> DataFrame:
-    """Transform bronze_conditions to flattened condition view."""
+    """Transform bronze_conditions to flattened condition view with SNOMED→ICD-10 mapping."""
     bronze_table = get_full_table_name(config, "bronze", "bronze_conditions")
     df = spark.table(bronze_table)
     
-    return pipe(
+    # Load SNOMED to ICD-10-CM lookup
+    snomed_map_table = get_full_table_name(config, "bronze", "lookup_snomed_icd10cm_map")
+    try:
+        snomed_map = spark.table(snomed_map_table).select(
+            F.col("snomed_concept_id"),
+            F.col("icd10cm_code"),
+            F.col("icd10cm_name"),
+            F.col("map_priority")
+        )
+    except:
+        print(f"Warning: {snomed_map_table} not found, skipping SNOMED→ICD-10 enrichment")
+        snomed_map = None
+    
+    transformed = pipe(
         df,
         generate_id("patient", "code", "start"),
         safe_to_date("start", "onset_date"),
@@ -235,27 +275,38 @@ def transform_condition(spark: SparkSession, config: PipelineConfig) -> DataFram
             F.when(F.col("stop").isNull() | (F.col("stop") == ""), "active").otherwise("resolved")),
         lambda df: df.withColumn("duration_days",
             F.when(F.col("abatement_date").isNotNull(),
-                F.datediff(F.col("abatement_date"), F.col("onset_date"))).otherwise(None)),
-        lambda df: df.select(
-            F.col("id").alias("condition_id"),
-            F.col("patient").alias("patient_id"),
-            F.col("encounter").alias("encounter_id"),
-            F.col("code").alias("condition_code"),
-            F.lit("http://snomed.info/sct").alias("code_system"),
-            F.col("description").alias("condition_description"),
-            F.lit("encounter-diagnosis").alias("category_code"),
-            F.lit("Encounter Diagnosis").alias("category_display"),
-            F.col("clinical_status"),
-            F.lit("confirmed").alias("verification_status"),
-            F.col("onset_date"),
-            F.col("abatement_date"),
-            F.col("onset_date").alias("recorded_date"),
-            F.col("duration_days"),
-            (F.col("clinical_status") == "active").alias("is_active"),
-            (F.col("clinical_status") == "resolved").alias("is_resolved"),
-            F.col("_rec_src").alias("source_system"),
-            F.current_timestamp().alias("last_updated"),
+                F.datediff(F.col("abatement_date"), F.col("onset_date"))).otherwise(None))
+    )
+    
+    # Join with SNOMED→ICD-10 map if available
+    if snomed_map is not None:
+        transformed = transformed.join(
+            snomed_map,
+            transformed["code"] == snomed_map["snomed_concept_id"],
+            "left"
         )
+    
+    return transformed.select(
+        F.col("id").alias("condition_id"),
+        F.col("patient").alias("patient_id"),
+        F.col("encounter").alias("encounter_id"),
+        F.col("code").alias("condition_code"),
+        F.lit("http://snomed.info/sct").alias("code_system"),
+        F.col("description").alias("condition_description"),
+        F.coalesce(F.col("icd10cm_code"), F.lit(None)).alias("icd10cm_code") if snomed_map else F.lit(None).alias("icd10cm_code"),
+        F.coalesce(F.col("icd10cm_name"), F.lit(None)).alias("icd10cm_name") if snomed_map else F.lit(None).alias("icd10cm_name"),
+        F.lit("encounter-diagnosis").alias("category_code"),
+        F.lit("Encounter Diagnosis").alias("category_display"),
+        F.col("clinical_status"),
+        F.lit("confirmed").alias("verification_status"),
+        F.col("onset_date"),
+        F.col("abatement_date"),
+        F.col("onset_date").alias("recorded_date"),
+        F.col("duration_days"),
+        (F.col("clinical_status") == "active").alias("is_active"),
+        (F.col("clinical_status") == "resolved").alias("is_resolved"),
+        F.col("_rec_src").alias("source_system"),
+        F.current_timestamp().alias("last_updated"),
     ).filter(F.col("patient_id").isNotNull() & F.col("condition_code").isNotNull())
 
 
@@ -304,42 +355,107 @@ def transform_observation(spark: SparkSession, config: PipelineConfig) -> DataFr
 
 
 def transform_procedure(spark: SparkSession, config: PipelineConfig) -> DataFrame:
-    """Transform bronze_procedures to flattened procedure view."""
+    """Transform bronze_procedures to flattened procedure view with HCPCS enrichment."""
     bronze_table = get_full_table_name(config, "bronze", "bronze_procedures")
     df = spark.table(bronze_table)
     
-    return pipe(
+    # Load HCPCS lookup
+    hcpcs_table = get_full_table_name(config, "bronze", "lookup_hcpcs_codes")
+    try:
+        hcpcs_lookup = spark.table(hcpcs_table).select(
+            F.col("hcpcs_code"),
+            F.col("short_description").alias("hcpcs_description"),
+            F.col("code_type").alias("hcpcs_code_type"),
+            F.col("code_category").alias("hcpcs_category"),
+            F.col("betos_code")
+        ).filter(F.col("is_active") == True)
+    except:
+        print(f"Warning: {hcpcs_table} not found, skipping HCPCS enrichment")
+        hcpcs_lookup = None
+    
+    transformed = pipe(
         df,
         generate_id("patient", "code", "start", "encounter"),
         safe_to_timestamp("start", "start_datetime"),
         safe_to_timestamp("stop", "end_datetime"),
-        safe_to_decimal("base_cost", "procedure_cost"),
-        lambda df: df.select(
-            F.col("id").alias("procedure_id"),
-            F.col("patient").alias("patient_id"),
-            F.col("encounter").alias("encounter_id"),
-            F.col("code").alias("procedure_code"),
-            F.lit("http://snomed.info/sct").alias("code_system"),
-            F.col("description").alias("procedure_description"),
-            F.lit("completed").alias("procedure_status"),
-            F.col("start_datetime"),
-            F.col("end_datetime"),
-            F.col("start_datetime").cast("date").alias("performed_date"),
-            F.col("procedure_cost"),
-            F.col("reasoncode").alias("reason_code"),
-            F.col("reasondescription").alias("reason_description"),
-            F.col("_rec_src").alias("source_system"),
-            F.current_timestamp().alias("last_updated"),
+        safe_to_decimal("base_cost", "procedure_cost")
+    )
+    
+    # Join with HCPCS lookup if available
+    if hcpcs_lookup is not None:
+        transformed = transformed.join(
+            hcpcs_lookup,
+            transformed["code"] == hcpcs_lookup["hcpcs_code"],
+            "left"
         )
+    
+    return transformed.select(
+        F.col("id").alias("procedure_id"),
+        F.col("patient").alias("patient_id"),
+        F.col("encounter").alias("encounter_id"),
+        F.col("code").alias("procedure_code"),
+        F.lit("http://snomed.info/sct").alias("code_system"),
+        F.col("description").alias("procedure_description"),
+        F.coalesce(F.col("hcpcs_code"), F.lit(None)).alias("hcpcs_code") if hcpcs_lookup else F.lit(None).alias("hcpcs_code"),
+        F.coalesce(F.col("hcpcs_description"), F.lit(None)).alias("hcpcs_description") if hcpcs_lookup else F.lit(None).alias("hcpcs_description"),
+        F.coalesce(F.col("hcpcs_code_type"), F.lit(None)).alias("hcpcs_code_type") if hcpcs_lookup else F.lit(None).alias("hcpcs_code_type"),
+        F.coalesce(F.col("betos_code"), F.lit(None)).alias("betos_code") if hcpcs_lookup else F.lit(None).alias("betos_code"),
+        F.lit("completed").alias("procedure_status"),
+        F.col("start_datetime"),
+        F.col("end_datetime"),
+        F.col("start_datetime").cast("date").alias("performed_date"),
+        F.col("procedure_cost"),
+        F.col("reasoncode").alias("reason_code"),
+        F.col("reasondescription").alias("reason_description"),
+        F.col("_rec_src").alias("source_system"),
+        F.current_timestamp().alias("last_updated"),
     ).filter(F.col("patient_id").isNotNull() & F.col("procedure_code").isNotNull())
 
 
 def transform_medication(spark: SparkSession, config: PipelineConfig) -> DataFrame:
-    """Transform bronze_medications to flattened medication view."""
+    """Transform bronze_medications to flattened medication view with RxNorm/NDC enrichment."""
     bronze_table = get_full_table_name(config, "bronze", "bronze_medications")
     df = spark.table(bronze_table)
     
-    return pipe(
+    # Load RxNorm concepts lookup
+    rxnorm_concepts_table = get_full_table_name(config, "bronze", "lookup_rxnorm_concepts")
+    try:
+        rxnorm_concepts = spark.table(rxnorm_concepts_table).select(
+            F.col("rxcui"),
+            F.col("rxnorm_name"),
+            F.col("tty").alias("rxnorm_term_type")
+        )
+    except:
+        print(f"Warning: {rxnorm_concepts_table} not found, skipping RxNorm enrichment")
+        rxnorm_concepts = None
+    
+    # Load RxNorm to NDC crosswalk
+    rxnorm_ndc_table = get_full_table_name(config, "bronze", "lookup_rxnorm_ndc_crosswalk")
+    try:
+        rxnorm_ndc = spark.table(rxnorm_ndc_table).select(
+            F.col("rxcui"),
+            F.col("ndc_11_digit").alias("ndc_code")
+        ).dropDuplicates(["rxcui"])  # Get one NDC per RXCUI (could be multiple)
+    except:
+        print(f"Warning: {rxnorm_ndc_table} not found, skipping RxNorm→NDC crosswalk")
+        rxnorm_ndc = None
+    
+    # Load NDC product lookup
+    ndc_product_table = get_full_table_name(config, "bronze", "lookup_ndc_product")
+    try:
+        ndc_product = spark.table(ndc_product_table).select(
+            F.col("product_ndc"),
+            F.col("proprietary_name"),
+            F.col("nonproprietary_name"),
+            F.col("dosage_form_name"),
+            F.col("route_name"),
+            F.col("labeler_name")
+        )
+    except:
+        print(f"Warning: {ndc_product_table} not found, skipping NDC enrichment")
+        ndc_product = None
+    
+    transformed = pipe(
         df,
         generate_id("patient", "code", "start"),
         safe_to_timestamp("start", "start_datetime"),
@@ -349,30 +465,63 @@ def transform_medication(spark: SparkSession, config: PipelineConfig) -> DataFra
         safe_to_decimal("payer_coverage", "payer_cov"),
         safe_to_long("dispenses", "dispenses_val"),
         lambda df: df.withColumn("patient_cost",
-            F.coalesce(F.col("total_cost"), F.lit(0)) - F.coalesce(F.col("payer_cov"), F.lit(0))),
-        lambda df: df.select(
-            F.col("id").alias("medication_id"),
-            F.col("patient").alias("patient_id"),
-            F.col("encounter").alias("encounter_id"),
-            F.col("payer").alias("payer_id"),
-            F.col("code").alias("medication_code"),
-            F.lit("http://www.nlm.nih.gov/research/umls/rxnorm").alias("code_system"),
-            F.col("description").alias("medication_description"),
-            F.when(F.col("stop").isNull() | (F.col("stop") == ""), "active").otherwise("completed").alias("rx_status"),
-            F.lit("order").alias("rx_intent"),
-            F.col("start_datetime").cast("date").alias("prescribed_date"),
-            F.col("start_datetime"),
-            F.col("end_datetime"),
-            (F.coalesce(F.col("dispenses_val"), F.lit(1)) - 1).alias("refills_allowed"),
-            F.col("reasondescription").alias("reason_description"),
-            F.col("base_cost_val").alias("base_cost"),
-            F.col("total_cost"),
-            F.col("payer_cov").alias("payer_coverage"),
-            F.col("patient_cost"),
-            (F.col("end_datetime").isNull()).alias("is_active"),
-            F.col("_rec_src").alias("source_system"),
-            F.current_timestamp().alias("last_updated"),
+            F.coalesce(F.col("total_cost"), F.lit(0)) - F.coalesce(F.col("payer_cov"), F.lit(0)))
+    )
+    
+    # Join with RxNorm concepts if available
+    if rxnorm_concepts is not None:
+        transformed = transformed.join(
+            rxnorm_concepts,
+            transformed["code"] == rxnorm_concepts["rxcui"],
+            "left"
         )
+    
+    # Join with RxNorm→NDC crosswalk if available
+    if rxnorm_ndc is not None:
+        transformed = transformed.join(
+            rxnorm_ndc,
+            transformed["code"] == rxnorm_ndc["rxcui"],
+            "left"
+        )
+    
+    # Join with NDC product if available
+    if ndc_product is not None and rxnorm_ndc is not None:
+        transformed = transformed.join(
+            ndc_product,
+            F.col("ndc_code") == ndc_product["product_ndc"],
+            "left"
+        )
+    
+    return transformed.select(
+        F.col("id").alias("medication_id"),
+        F.col("patient").alias("patient_id"),
+        F.col("encounter").alias("encounter_id"),
+        F.col("payer").alias("payer_id"),
+        F.col("code").alias("medication_code"),
+        F.lit("http://www.nlm.nih.gov/research/umls/rxnorm").alias("code_system"),
+        F.col("description").alias("medication_description"),
+        F.coalesce(F.col("rxnorm_name"), F.lit(None)).alias("rxnorm_name") if rxnorm_concepts else F.lit(None).alias("rxnorm_name"),
+        F.coalesce(F.col("rxnorm_term_type"), F.lit(None)).alias("rxnorm_term_type") if rxnorm_concepts else F.lit(None).alias("rxnorm_term_type"),
+        F.coalesce(F.col("ndc_code"), F.lit(None)).alias("ndc_code") if rxnorm_ndc else F.lit(None).alias("ndc_code"),
+        F.coalesce(F.col("proprietary_name"), F.lit(None)).alias("ndc_proprietary_name") if ndc_product else F.lit(None).alias("ndc_proprietary_name"),
+        F.coalesce(F.col("nonproprietary_name"), F.lit(None)).alias("ndc_nonproprietary_name") if ndc_product else F.lit(None).alias("ndc_nonproprietary_name"),
+        F.coalesce(F.col("dosage_form_name"), F.lit(None)).alias("dosage_form") if ndc_product else F.lit(None).alias("dosage_form"),
+        F.coalesce(F.col("route_name"), F.lit(None)).alias("route") if ndc_product else F.lit(None).alias("route"),
+        F.coalesce(F.col("labeler_name"), F.lit(None)).alias("manufacturer") if ndc_product else F.lit(None).alias("manufacturer"),
+        F.when(F.col("stop").isNull() | (F.col("stop") == ""), "active").otherwise("completed").alias("rx_status"),
+        F.lit("order").alias("rx_intent"),
+        F.col("start_datetime").cast("date").alias("prescribed_date"),
+        F.col("start_datetime"),
+        F.col("end_datetime"),
+        (F.coalesce(F.col("dispenses_val"), F.lit(1)) - 1).alias("refills_allowed"),
+        F.col("reasondescription").alias("reason_description"),
+        F.col("base_cost_val").alias("base_cost"),
+        F.col("total_cost"),
+        F.col("payer_cov").alias("payer_coverage"),
+        F.col("patient_cost"),
+        (F.col("end_datetime").isNull()).alias("is_active"),
+        F.col("_rec_src").alias("source_system"),
+        F.current_timestamp().alias("last_updated"),
     ).filter(F.col("patient_id").isNotNull() & F.col("medication_code").isNotNull())
 
 
@@ -444,11 +593,23 @@ def transform_practitioner(spark: SparkSession, config: PipelineConfig) -> DataF
 
 
 def transform_allergy(spark: SparkSession, config: PipelineConfig) -> DataFrame:
-    """Transform bronze_allergies to flattened allergy intolerance view."""
+    """Transform bronze_allergies to flattened allergy intolerance view with RxNorm enrichment."""
     bronze_table = get_full_table_name(config, "bronze", "bronze_allergies")
     df = spark.table(bronze_table)
     
-    return pipe(
+    # Load RxNorm concepts for drug allergies
+    rxnorm_concepts_table = get_full_table_name(config, "bronze", "lookup_rxnorm_concepts")
+    try:
+        rxnorm_concepts = spark.table(rxnorm_concepts_table).select(
+            F.col("rxcui"),
+            F.col("rxnorm_name"),
+            F.col("tty").alias("rxnorm_term_type")
+        )
+    except:
+        print(f"Warning: {rxnorm_concepts_table} not found, skipping RxNorm enrichment for allergies")
+        rxnorm_concepts = None
+    
+    transformed = pipe(
         df,
         generate_id("patient", "code", "start"),
         safe_to_date("start", "onset_date"),
@@ -459,32 +620,43 @@ def transform_allergy(spark: SparkSession, config: PipelineConfig) -> DataFrame:
             F.when(
                 (F.lower(F.col("severity1")) == "severe") | (F.lower(F.col("severity2")) == "severe"),
                 "high"
-            ).otherwise("low")),
-        lambda df: df.select(
-            F.col("id").alias("allergy_id"),
-            F.col("patient").alias("patient_id"),
-            F.col("encounter").alias("encounter_id"),
-            F.col("code").alias("allergy_code"),
-            F.coalesce(F.col("system"), F.lit("http://snomed.info/sct")).alias("code_system"),
-            F.col("description").alias("allergy_description"),
-            F.col("clinical_status"),
-            F.lit("confirmed").alias("verification_status"),
-            F.coalesce(F.lower(F.col("type")), F.lit("allergy")).alias("allergy_type"),
-            F.coalesce(F.lower(F.col("category")), F.lit("environment")).alias("category"),
-            F.col("criticality"),
-            F.col("onset_date"),
-            F.col("onset_date").alias("recorded_date"),
-            F.col("resolution_date"),
-            F.col("reaction1").alias("primary_reaction_code"),
-            F.col("description1").alias("primary_reaction"),
-            F.when(F.lower(F.col("severity1")) == "severe", "severe")
-             .when(F.lower(F.col("severity1")) == "moderate", "moderate")
-             .otherwise("mild").alias("reaction_severity"),
-            (F.col("clinical_status") == "active").alias("is_active"),
-            (F.col("criticality") == "high").alias("is_high_criticality"),
-            F.col("_rec_src").alias("source_system"),
-            F.current_timestamp().alias("last_updated"),
+            ).otherwise("low"))
+    )
+    
+    # Join with RxNorm for drug allergies if available
+    if rxnorm_concepts is not None:
+        transformed = transformed.join(
+            rxnorm_concepts,
+            transformed["code"] == rxnorm_concepts["rxcui"],
+            "left"
         )
+    
+    return transformed.select(
+        F.col("id").alias("allergy_id"),
+        F.col("patient").alias("patient_id"),
+        F.col("encounter").alias("encounter_id"),
+        F.col("code").alias("allergy_code"),
+        F.coalesce(F.col("system"), F.lit("http://snomed.info/sct")).alias("code_system"),
+        F.col("description").alias("allergy_description"),
+        F.coalesce(F.col("rxnorm_name"), F.lit(None)).alias("rxnorm_name") if rxnorm_concepts else F.lit(None).alias("rxnorm_name"),
+        F.coalesce(F.col("rxnorm_term_type"), F.lit(None)).alias("rxnorm_term_type") if rxnorm_concepts else F.lit(None).alias("rxnorm_term_type"),
+        F.col("clinical_status"),
+        F.lit("confirmed").alias("verification_status"),
+        F.coalesce(F.lower(F.col("type")), F.lit("allergy")).alias("allergy_type"),
+        F.coalesce(F.lower(F.col("category")), F.lit("environment")).alias("category"),
+        F.col("criticality"),
+        F.col("onset_date"),
+        F.col("onset_date").alias("recorded_date"),
+        F.col("resolution_date"),
+        F.col("reaction1").alias("primary_reaction_code"),
+        F.col("description1").alias("primary_reaction"),
+        F.when(F.lower(F.col("severity1")) == "severe", "severe")
+         .when(F.lower(F.col("severity1")) == "moderate", "moderate")
+         .otherwise("mild").alias("reaction_severity"),
+        (F.col("clinical_status") == "active").alias("is_active"),
+        (F.col("criticality") == "high").alias("is_high_criticality"),
+        F.col("_rec_src").alias("source_system"),
+        F.current_timestamp().alias("last_updated"),
     ).filter(F.col("patient_id").isNotNull() & F.col("allergy_code").isNotNull())
 
 
@@ -529,11 +701,23 @@ def transform_careplan(spark: SparkSession, config: PipelineConfig) -> DataFrame
 
 
 def transform_claim(spark: SparkSession, config: PipelineConfig) -> DataFrame:
-    """Transform bronze_claims to flattened claim view."""
+    """Transform bronze_claims to flattened claim view with ICD-10-CM enrichment."""
     bronze_table = get_full_table_name(config, "bronze", "bronze_claims")
     df = spark.table(bronze_table)
     
-    return pipe(
+    # Load ICD-10-CM lookup for diagnosis codes
+    icd10cm_table = get_full_table_name(config, "bronze", "lookup_icd10cm_codes")
+    try:
+        icd10cm_lookup = spark.table(icd10cm_table).select(
+            F.col("icd10cm_code"),
+            F.col("short_description").alias("icd10cm_short_desc"),
+            F.col("long_description").alias("icd10cm_long_desc")
+        )
+    except:
+        print(f"Warning: {icd10cm_table} not found, skipping ICD-10-CM enrichment")
+        icd10cm_lookup = None
+    
+    transformed = pipe(
         df,
         safe_to_date("servicedate", "service_date"),
         safe_to_date("currentillnessdate", "illness_date"),
@@ -545,36 +729,76 @@ def transform_claim(spark: SparkSession, config: PipelineConfig) -> DataFrame:
             F.size(F.array_remove(F.array(
                 F.col("diagnosis1"), F.col("diagnosis2"), F.col("diagnosis3"), F.col("diagnosis4"),
                 F.col("diagnosis5"), F.col("diagnosis6"), F.col("diagnosis7"), F.col("diagnosis8")
-            ), None))),
-        lambda df: df.select(
-            F.col("id").alias("claim_id"),
-            F.col("patientid").alias("patient_id"),
-            F.col("providerid").alias("provider_id"),
-            F.col("primarypatientinsuranceid").alias("primary_coverage_id"),
-            F.col("secondarypatientinsuranceid").alias("secondary_coverage_id"),
-            F.lit("professional").alias("claim_type_code"),
-            F.lit("Professional").alias("claim_type"),
-            F.lit("active").alias("claim_status"),
-            F.lit("claim").alias("claim_use"),
-            F.coalesce(F.col("service_date"), F.col("illness_date")).alias("service_date"),
-            F.coalesce(F.col("service_date"), F.col("illness_date")).alias("created_date"),
-            F.col("diagnosis1").alias("primary_diagnosis_code"),
-            F.col("diagnosis2").alias("secondary_diagnosis_code"),
-            F.col("diagnosis_count"),
-            F.col("total_outstanding").alias("total_amount"),
-            F.col("appointmentid").alias("encounter_id"),
-            F.col("_rec_src").alias("source_system"),
-            F.current_timestamp().alias("last_updated"),
+            ), None)))
+    )
+    
+    # Join with ICD-10-CM lookup for primary diagnosis if available
+    if icd10cm_lookup is not None:
+        icd10cm_primary = icd10cm_lookup.selectExpr(
+            "icd10cm_code as dx1_code",
+            "icd10cm_short_desc as dx1_short_desc",
+            "icd10cm_long_desc as dx1_long_desc"
         )
+        transformed = transformed.join(
+            icd10cm_primary,
+            transformed["diagnosis1"] == icd10cm_primary["dx1_code"],
+            "left"
+        )
+        
+        # Join for secondary diagnosis
+        icd10cm_secondary = icd10cm_lookup.selectExpr(
+            "icd10cm_code as dx2_code",
+            "icd10cm_short_desc as dx2_short_desc",
+            "icd10cm_long_desc as dx2_long_desc"
+        )
+        transformed = transformed.join(
+            icd10cm_secondary,
+            transformed["diagnosis2"] == icd10cm_secondary["dx2_code"],
+            "left"
+        )
+    
+    return transformed.select(
+        F.col("id").alias("claim_id"),
+        F.col("patientid").alias("patient_id"),
+        F.col("providerid").alias("provider_id"),
+        F.col("primarypatientinsuranceid").alias("primary_coverage_id"),
+        F.col("secondarypatientinsuranceid").alias("secondary_coverage_id"),
+        F.lit("professional").alias("claim_type_code"),
+        F.lit("Professional").alias("claim_type"),
+        F.lit("active").alias("claim_status"),
+        F.lit("claim").alias("claim_use"),
+        F.coalesce(F.col("service_date"), F.col("illness_date")).alias("service_date"),
+        F.coalesce(F.col("service_date"), F.col("illness_date")).alias("created_date"),
+        F.col("diagnosis1").alias("primary_diagnosis_code"),
+        F.coalesce(F.col("dx1_short_desc"), F.lit(None)).alias("primary_diagnosis_desc") if icd10cm_lookup else F.lit(None).alias("primary_diagnosis_desc"),
+        F.col("diagnosis2").alias("secondary_diagnosis_code"),
+        F.coalesce(F.col("dx2_short_desc"), F.lit(None)).alias("secondary_diagnosis_desc") if icd10cm_lookup else F.lit(None).alias("secondary_diagnosis_desc"),
+        F.col("diagnosis_count"),
+        F.col("total_outstanding").alias("total_amount"),
+        F.col("appointmentid").alias("encounter_id"),
+        F.col("_rec_src").alias("source_system"),
+        F.current_timestamp().alias("last_updated"),
     ).filter(F.col("claim_id").isNotNull() & F.col("patient_id").isNotNull())
 
 
 def transform_claimresponse(spark: SparkSession, config: PipelineConfig) -> DataFrame:
-    """Transform bronze_claims_transactions to flattened claim response view."""
+    """Transform bronze_claims_transactions to flattened claim response view with HCPCS enrichment."""
     bronze_table = get_full_table_name(config, "bronze", "bronze_claims_transactions")
     df = spark.table(bronze_table)
     
-    return pipe(
+    # Load HCPCS lookup for procedure codes
+    hcpcs_table = get_full_table_name(config, "bronze", "lookup_hcpcs_codes")
+    try:
+        hcpcs_lookup = spark.table(hcpcs_table).select(
+            F.col("hcpcs_code"),
+            F.col("short_description").alias("hcpcs_description"),
+            F.col("code_type").alias("hcpcs_code_type")
+        ).filter(F.col("is_active") == True)
+    except:
+        print(f"Warning: {hcpcs_table} not found, skipping HCPCS enrichment for claim responses")
+        hcpcs_lookup = None
+    
+    transformed = pipe(
         df,
         safe_to_date("fromdate", "from_date"),
         safe_to_date("todate", "to_date"),
@@ -585,25 +809,36 @@ def transform_claimresponse(spark: SparkSession, config: PipelineConfig) -> Data
         lambda df: df.withColumn("outcome",
             F.when(F.coalesce(F.col("outstanding_amount"), F.lit(0)) == 0, "complete")
              .when(F.coalesce(F.col("payment_amount"), F.lit(0)) > 0, "partial")
-             .otherwise("queued")),
-        lambda df: df.select(
-            F.col("id").alias("claimresponse_id"),
-            F.col("claimid").alias("claim_id"),
-            F.col("patientid").alias("patient_id"),
-            F.lit("active").alias("response_status"),
-            F.col("outcome"),
-            F.col("from_date").alias("created_date"),
-            F.col("submitted_amount"),
-            F.col("payment_amount").alias("benefit_amount"),
-            F.col("payment_amount"),
-            F.col("to_date").alias("payment_date"),
-            F.col("outstanding_amount"),
-            F.col("procedurecode").alias("procedure_code"),
-            (F.col("outcome") == "complete").alias("is_complete"),
-            (F.col("outcome") == "partial").alias("is_partial"),
-            F.col("_rec_src").alias("source_system"),
-            F.current_timestamp().alias("last_updated"),
+             .otherwise("queued"))
+    )
+    
+    # Join with HCPCS lookup if available
+    if hcpcs_lookup is not None:
+        transformed = transformed.join(
+            hcpcs_lookup,
+            transformed["procedurecode"] == hcpcs_lookup["hcpcs_code"],
+            "left"
         )
+    
+    return transformed.select(
+        F.col("id").alias("claimresponse_id"),
+        F.col("claimid").alias("claim_id"),
+        F.col("patientid").alias("patient_id"),
+        F.lit("active").alias("response_status"),
+        F.col("outcome"),
+        F.col("from_date").alias("created_date"),
+        F.col("submitted_amount"),
+        F.col("payment_amount").alias("benefit_amount"),
+        F.col("payment_amount"),
+        F.col("to_date").alias("payment_date"),
+        F.col("outstanding_amount"),
+        F.col("procedurecode").alias("procedure_code"),
+        F.coalesce(F.col("hcpcs_description"), F.lit(None)).alias("procedure_description") if hcpcs_lookup else F.lit(None).alias("procedure_description"),
+        F.coalesce(F.col("hcpcs_code_type"), F.lit(None)).alias("procedure_code_type") if hcpcs_lookup else F.lit(None).alias("procedure_code_type"),
+        (F.col("outcome") == "complete").alias("is_complete"),
+        (F.col("outcome") == "partial").alias("is_partial"),
+        F.col("_rec_src").alias("source_system"),
+        F.current_timestamp().alias("last_updated"),
     ).filter(F.col("claimresponse_id").isNotNull() & F.col("claim_id").isNotNull())
 
 

@@ -17,7 +17,9 @@ from .config import PipelineConfig, get_full_table_name
 
 
 def surrogate_key(*cols: str) -> F.Column:
-    """Generate SHA-256 surrogate key from columns."""
+    """Generate SHA-256 surrogate key from columns. If only one column is passed, use it directly; otherwise concat all with '|'."""
+    if len(cols) == 1:
+        return F.sha2(F.coalesce(F.col(cols[0]), F.lit("")).cast("string"), 256)
     return F.sha2(F.concat_ws("|", *[F.coalesce(F.col(c), F.lit("")) for c in cols]), 256)
 
 
