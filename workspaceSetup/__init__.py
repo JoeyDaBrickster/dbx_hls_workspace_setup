@@ -12,6 +12,16 @@ Usage:
     
     config = create_config(catalog="my_catalog")
     result = run_pipeline(spark, config)
+    
+Reference Data Loading:
+    from workspaceSetup import (
+        run_reference_ingestion, 
+        create_reference_config,
+        verify_reference_tables
+    )
+    
+    ref_config = create_reference_config(catalog="healthcare_dev")
+    results = run_reference_ingestion(spark, ref_config)
 """
 
 from .config import (
@@ -35,6 +45,23 @@ from .run_pipeline import (
 
 from .cleanup import cleanup, CleanupConfig, CleanupResult
 
+# Reference Data Ingestion
+from .reference_config import (
+    ReferenceConfig,
+    ReferenceLoadResult,
+    create_reference_config,
+    create_reference_config_from_widgets,
+    setup_reference_widgets,
+    setup_reference_schema
+)
+
+from .reference_ingestion import (
+    run_reference_ingestion,
+    run_reference_ingestion_single,
+    verify_reference_tables,
+    AVAILABLE_LOADERS
+)
+
 __all__ = [
     # Config
     "PipelineConfig",
@@ -55,4 +82,15 @@ __all__ = [
     "cleanup",
     "CleanupConfig",
     "CleanupResult",
+    # Reference Data
+    "ReferenceConfig",
+    "ReferenceLoadResult",
+    "create_reference_config",
+    "create_reference_config_from_widgets",
+    "setup_reference_widgets",
+    "setup_reference_schema",
+    "run_reference_ingestion",
+    "run_reference_ingestion_single",
+    "verify_reference_tables",
+    "AVAILABLE_LOADERS",
 ]
